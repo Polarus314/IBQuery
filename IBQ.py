@@ -3,18 +3,11 @@
 from ibapi.client import *
 from ibapi.wrapper import *
 from ibapi.ticktype import TickTypeEnum
-import time
-import threading
 import redis
 
 class App(EClient, EWrapper):
     myRedis = None #redis对象
-    kv_reqId_symbol = None #键值对，{reqId: symbol}
 
-    tqqq_price = None
-    ndx_price = None
-    nq_bid_price = None
-    nq_ask_price = None
     def __init__(self):
         EClient.__init__(self, self)
         self.myRedis = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True) # 连接到 Redis
@@ -138,7 +131,8 @@ class App(EClient, EWrapper):
         return contract
 
     def marketDataType(self, app, type):
-        """API 可以在使用 reqMktData 发出市场数据请求之前通过IBApi.EClient.reqMarketDataType切换市场数据类型,
+        """
+        API 可以在使用 reqMktData 发出市场数据请求之前通过IBApi.EClient.reqMarketDataType切换市场数据类型,
         从而从 Trader Workstation 请求实时、冻结、延迟和延迟冻结市场数据。
         ID      类型        描述
         1       实时        实时市场数据是实时回传的流数据。需要订阅市场数据才能接收实时市场数据。
@@ -149,7 +143,7 @@ class App(EClient, EWrapper):
                             当您将市场数据类型设置为延迟时，您是在告诉 TWS,如果用户没有必要的实时数据订阅，则自动切换到延迟市场数据。
                             如果有实时数据，则 TWS 将忽略延迟数据请求。
         4       延迟冻结    对于没有市场数据订阅的用户，请求延迟“冻结”数据。
-                    """
+        """
         if type == "Live":
             app.reqMarketDataType(1)
         elif type == "Frozen":
@@ -164,6 +158,97 @@ class App(EClient, EWrapper):
         """展示合约市场数据"""
         # 请求合约详细信息，以获取 conId
         self.reqContractDetails(reqId, contract)
+
+    def position(self, account, contract, position, avgCost):
+        """处理持仓信息"""
+        symbol = contract.symbol
+        secType = contract.secType
+        exchange = contract.exchange
+        
+        # 调试信息 - 打印整个合约对象的属性
+        print(f"Debug - Contract for {symbol} ({secType}):")
+        if secType == "OPT":
+            print(f"  Contract details: {dir(contract)}")
+        
+        # 更健壮的属性获取方式
+        try:
+            expiry = contract.lastTradeDateOrContractMonth if hasattr(contract, 'lastTradeDateOrContractMonth') else ""
+            strike = contract.strike if hasattr(contract, 'strike') else 0
+            right = contract.right if hasattr(contract, 'right') else ""
+            
+            # 尝试从contract.Contract属性中获取
+            if secType == "OPT" and (not expiry or not strike or not right):
+                if hasattr(contract, 'contract'):
+                    inner_contract = contract.contract
+                    expiry = inner_contract.lastTradeDateOrContractMonth if not expiry and hasattr(inner_contract, 'lastTradeDateOrContractMonth') else expiry
+                    strike = inner_contract.strike if not strike and hasattr(inner_contract, 'strike') else strike
+                    right = inner_contract.right if not right and hasattr(inner_contract, 'right') else right
+        except Exception as e:
+            print(f"Error getting option details: {e}")
+            expiry = ""
+            strike = 0
+            right = ""
+        
+        # 尝试访问其他可能的属性名称
+        if secType == "OPT" and not expiry:
+            possible_expiry_attrs = ['expiry', 'expirationDate', 'expDate', 'expiration']
+            for attr in possible_expiry_attrs:
+                if hasattr(contract, attr):
+                    expiry = getattr(contract, attr)
+                    print(f"Found expiry in attribute: {attr}")
+                    break
+        
+        position_key = f"position:{symbol}:{secType}"
+        if expiry:
+            position_key += f":{expiry}"
+        if strike > 0:
+            position_key += f":{strike}:{right}"
+        
+        # 将持仓信息存储到Redis
+        self.myRedis.hset(position_key, "account", account)
+        self.myRedis.hset(position_key, "symbol", symbol)
+        self.myRedis.hset(position_key, "secType", secType)
+        self.myRedis.hset(position_key, "exchange", exchange)
+        self.myRedis.hset(position_key, "position", position)
+        self.myRedis.hset(position_key, "avgCost", avgCost)
+        
+        # 存储期权特有信息
+        if expiry:
+            self.myRedis.hset(position_key, "expiry", expiry)
+        if strike > 0:
+            self.myRedis.hset(position_key, "strike", strike)
+        if right:
+            self.myRedis.hset(position_key, "right", right)
+        
+        # 打印持仓信息
+        contract_desc = f"{symbol} ({secType})"
+        if secType == "OPT":
+            option_info = []
+            if expiry: option_info.append(f"到期:{expiry}")
+            if strike > 0: option_info.append(f"行权价:{strike}")
+            if right: option_info.append(f"{right}")
+            if option_info:
+                contract_desc += f" {' '.join(option_info)}"
+            else:
+                contract_desc += " (期权详情未获取到)"
+        elif secType == "FUT" and expiry:
+            contract_desc += f" {expiry}"
+        
+        print(f"Position: {account}, {contract_desc}: {position} @ {avgCost}")
+
+    def positionEnd(self):
+        """持仓信息接收完毕"""
+        print("======== End of Positions ========")
+        
+    def accountSummary(self, reqId, account, tag, value, currency):
+        """处理账户摘要信息"""
+        key = f"account:{account}:{tag}"
+        self.myRedis.set(key, value)
+        print(f"Account Summary: {account}, {tag}: {value} {currency}")
+
+    def accountSummaryEnd(self, reqId):
+        """账户摘要信息接收完毕"""
+        print("======== End of Account Summary ========")
 
 
 
