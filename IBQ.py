@@ -1,5 +1,4 @@
 
-# 尝试使用官方 API 从 IBKR TWS 获取市场数据，获取 NDX 指数、指数期权的行情信息，进行计算后给出 NQ 期货的合理报价
 from ibapi.client import *
 from ibapi.wrapper import *
 from ibapi.ticktype import TickTypeEnum
@@ -73,11 +72,9 @@ class App(EClient, EWrapper):
     
     def contractDetails(self, reqId, contractDetails):
         """处理合约详细信息，获取 conId"""
-        print(f"ContractDetails received: {contractDetails}")
         # 一旦接收到合约详细信息，获取 conId
         contract = contractDetails.contract
         self.contractConId = contract.conId
-        print(f"Received conId: {self.contractConId}")
         
         # 获取到 conId 后，发送市场数据请求
         self.reqMktData(reqId, contract, "", False, False, [])  # 获取实时行情数据
@@ -160,80 +157,100 @@ class App(EClient, EWrapper):
         self.reqContractDetails(reqId, contract)
 
     def position(self, account, contract, position, avgCost):
-        """处理持仓信息"""
-        symbol = contract.symbol
-        secType = contract.secType
-        exchange = contract.exchange
+        """
+            处理持仓信息回调函数
+            
+            当调用reqPositions()方法后，IB API会通过此回调函数返回账户的所有持仓信息。
+            该函数负责解析合约详情，提取证券特有属性，并将持仓数据存储到Redis中。
+            
+            参数:
+                account (str): 交易账户ID
+                contract (Contract): 合约对象，包含证券的详细信息
+                position (float): 持仓数量，正数表示多头，负数表示空头
+                avgCost (float): 持仓的平均成本价格
+        """
         
-        # 调试信息 - 打印整个合约对象的属性
-        print(f"Debug - Contract for {symbol} ({secType}):")
-        if secType == "OPT":
-            print(f"  Contract details: {dir(contract)}")
+        # 提取基本合约信息
+        symbol = contract.symbol      # 证券代码/符号
+        secType = contract.secType    # 证券类型(STK股票/OPT期权/FUT期货等)
+        exchange = contract.exchange  # 交易所
         
-        # 更健壮的属性获取方式
+        # 尝试获取期权和期货特有属性
         try:
+            # 检查合约对象是否包含特定属性，如果有则提取，没有则使用默认值
             expiry = contract.lastTradeDateOrContractMonth if hasattr(contract, 'lastTradeDateOrContractMonth') else ""
             strike = contract.strike if hasattr(contract, 'strike') else 0
             right = contract.right if hasattr(contract, 'right') else ""
             
-            # 尝试从contract.Contract属性中获取
+            # 处理特殊情况：有些IB合约对象可能将详情嵌套在contract属性中
             if secType == "OPT" and (not expiry or not strike or not right):
                 if hasattr(contract, 'contract'):
+                    # 尝试从嵌套合约对象获取缺失的信息
                     inner_contract = contract.contract
+                    # 仅当当前值为空时才从内部合约获取
                     expiry = inner_contract.lastTradeDateOrContractMonth if not expiry and hasattr(inner_contract, 'lastTradeDateOrContractMonth') else expiry
                     strike = inner_contract.strike if not strike and hasattr(inner_contract, 'strike') else strike
                     right = inner_contract.right if not right and hasattr(inner_contract, 'right') else right
         except Exception as e:
-            print(f"Error getting option details: {e}")
+            # 异常情况下使用默认值
             expiry = ""
             strike = 0
             right = ""
         
-        # 尝试访问其他可能的属性名称
+        # 尝试从其他可能的属性名称获取到期日信息(不同版本的API可能使用不同的属性名)
         if secType == "OPT" and not expiry:
             possible_expiry_attrs = ['expiry', 'expirationDate', 'expDate', 'expiration']
             for attr in possible_expiry_attrs:
                 if hasattr(contract, attr):
                     expiry = getattr(contract, attr)
-                    print(f"Found expiry in attribute: {attr}")
                     break
         
+        # 构造Redis中的持仓键名
+        # 基本格式: position:证券代码:证券类型
         position_key = f"position:{symbol}:{secType}"
+        # 针对期权和期货，在键名中添加到期日信息
         if expiry:
             position_key += f":{expiry}"
+        # 针对期权，在键名中添加行权价和期权类型(看涨/看跌)
         if strike > 0:
             position_key += f":{strike}:{right}"
         
-        # 将持仓信息存储到Redis
-        self.myRedis.hset(position_key, "account", account)
-        self.myRedis.hset(position_key, "symbol", symbol)
-        self.myRedis.hset(position_key, "secType", secType)
-        self.myRedis.hset(position_key, "exchange", exchange)
-        self.myRedis.hset(position_key, "position", position)
-        self.myRedis.hset(position_key, "avgCost", avgCost)
+        # 将持仓信息存储到Redis的哈希表中
+        # 基本信息对所有证券类型都通用# 将持仓信息存储到Redis
+        self.myRedis.hset(position_key, "account", account)    # 账户ID
+        self.myRedis.hset(position_key, "symbol", symbol)      # 证券代码
+        self.myRedis.hset(position_key, "secType", secType)    # 证券类型
+        self.myRedis.hset(position_key, "exchange", exchange)  # 交易所
+        self.myRedis.hset(position_key, "position", position)  # 持仓数量
+        self.myRedis.hset(position_key, "avgCost", avgCost)    # 平均成本
         
-        # 存储期权特有信息
+        # 存储期权和期货特有信息
         if expiry:
-            self.myRedis.hset(position_key, "expiry", expiry)
+            self.myRedis.hset(position_key, "expiry", expiry)  # 到期日
         if strike > 0:
-            self.myRedis.hset(position_key, "strike", strike)
+            self.myRedis.hset(position_key, "strike", strike)  # 行权价
         if right:
-            self.myRedis.hset(position_key, "right", right)
+            self.myRedis.hset(position_key, "right", right)    # 期权类型(C=看涨/P=看跌)
         
-        # 打印持仓信息
+        # 构建用于控制台显示的合约描述字符串
         contract_desc = f"{symbol} ({secType})"
-        if secType == "OPT":
+
+        # 根据不同的证券类型，添加特有信息到描述字符串
+        if secType == "OPT":  # 期权特有信息
             option_info = []
             if expiry: option_info.append(f"到期:{expiry}")
             if strike > 0: option_info.append(f"行权价:{strike}")
             if right: option_info.append(f"{right}")
+
+            # 如果成功提取到期权信息，则显示；否则显示错误提示
             if option_info:
                 contract_desc += f" {' '.join(option_info)}"
             else:
                 contract_desc += " (期权详情未获取到)"
-        elif secType == "FUT" and expiry:
+        elif secType == "FUT" and expiry:  # 期货特有信息
             contract_desc += f" {expiry}"
         
+        # 打印持仓信息到控制台
         print(f"Position: {account}, {contract_desc}: {position} @ {avgCost}")
 
     def positionEnd(self):
